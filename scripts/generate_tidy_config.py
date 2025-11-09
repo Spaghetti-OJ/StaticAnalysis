@@ -8,6 +8,7 @@ options = {
     "loops": "--forbid-loops" in sys.argv,
     "arrays": "--forbid-arrays" in sys.argv,
     "functions": "--forbid-functions" in sys.argv,
+    "stl": "--forbid-stl" in sys.argv,
 }
 
 # 擷取禁止函式清單，例如：
@@ -35,6 +36,8 @@ if options["arrays"]:
     checks.append("misc-forbid-arrays")
 if options["functions"]:
     checks.append("misc-forbid-functions")
+if options["stl"]:
+    checks.append("misc-forbid-stl")
 
 # clang-tidy 設定
 config = {

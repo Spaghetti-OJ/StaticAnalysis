@@ -3,6 +3,7 @@
 #include "misc/ForbidLoopsCheck.h"
 #include "misc/ForbidArraysCheck.h"
 #include "misc/ForbidFunctionsCheck.h"
+#include "misc/ForbidSTLCheck.h"
 
 using namespace clang::tidy;
 
@@ -14,6 +15,7 @@ public:
     Factories.registerCheck<ForbidLoopsCheck>("misc-forbid-loops");
     Factories.registerCheck<ForbidArraysCheck>("misc-forbid-arrays");
     Factories.registerCheck<ForbidFunctionsCheck>("misc-forbid-functions");
+    Factories.registerCheck<ForbidSTLCheck>("misc-forbid-stl");
   }
 };
 

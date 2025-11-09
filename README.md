@@ -1,18 +1,54 @@
 
 本專案提供一組簡單的 clang-tidy 自訂規則（module），用於 Online Judge（OJ）在批改階段進行靜態分析，例如禁止迴圈、禁止陣列、或禁止特定函式的使用。
 
+## 快速開始
+
+```bash
+# 1. 編譯模組（在 WSL/Linux 環境）
+mkdir -p build && cd build
+cmake .. && cmake --build . --config Release
+cd ..
+
+# 2. 生成配置（例如：禁用迴圈和陣列）
+python3 scripts/generate_tidy_config.py --forbid-loops --forbid-arrays
+
+# 3. 執行檢查
+clang-tidy your_code.c \
+    -load ./build/libMiscTidyModule.so \
+    -export-fixes=fixes.yaml \
+    -- -std=c17
+
+# 4. 查看結果
+cat fixes.yaml
+```
+
 ## 主要功能
-- 禁用迴圈（`misc-forbid-loops`）：for / while / do-while。
-- 禁用陣列（`misc-forbid-arrays`）：任何陣列型別的宣告。
-- 禁用函式（`misc-forbid-functions`）：可在程式中擴充待禁用函式清單（範例預設包含 `sort`）。
-- 支援輸出 clang-tidy fixes JSON（可供 OJ 系統解析）。
+
+- 禁用迴圈（`misc-forbid-loops`）：for / while / do-while
+- 禁用陣列（`misc-forbid-arrays`）：任何陣列型別的宣告
+- 禁用函式（`misc-forbid-functions`）：可配置禁用函式清單（如 `sort`、`printf`、`malloc`）
+- 禁用 STL（`misc-forbid-stl`）：禁止使用 C++ 標準模板庫（std::vector、std::string、std::cout 等）
+- 支援輸出 YAML 格式的診斷結果（可供 OJ 系統解析）
+- 所有警告自動轉換為錯誤（`WarningsAsErrors: '*'`）
 
 ## 檔案一覽
-- `CMakeLists.txt` — 建置設定（需要 LLVM/Clang 開發套件）。
-- `include/misc/*.h`、`src/*.cpp` — 各檢查的標頭與實作。
-- `presets/*.yaml` — 範例的 `.clang-tidy` preset 檔案（forbid_loops / forbid_arrays / forbid_both）。
-- `scripts/generate_tidy_config.py` — 生成 `.clang-tidy` 的小腳本（可由題目設定自動呼叫）。
-- `scripts/run_tidy.sh` — 在類 Unix 環境下的執行包裝腳本（示範如何一起載入模組並導出 JSON）。
+
+- `CMakeLists.txt` — 建置設定（需要 LLVM/Clang 開發套件）
+- `include/misc/*.h` — 各檢查的標頭檔
+- `src/*.cpp` — 各檢查的實作與模組註冊
+  - `ForbidLoopsCheck.cpp` — 禁用迴圈檢查
+  - `ForbidArraysCheck.cpp` — 禁用陣列檢查
+  - `ForbidFunctionsCheck.cpp` — 禁用特定函式檢查
+  - `ForbidSTLCheck.cpp` — 禁用 STL 檢查（C++ 專用）
+  - `RegisterModule.cpp` — 模組註冊入口
+- `scripts/generate_tidy_config.py` — 生成 `.clang-tidy` 配置檔的腳本
+  - 支援 `--forbid-loops`、`--forbid-arrays`、`--forbid-functions`、`--forbid-stl`
+  - 支援 `--function-names` 指定禁用函式清單
+  - 支援 `--output-dir` 指定輸出目錄
+- `examples/` — 測試用範例程式
+  - `main.c` — C 語言範例（包含陣列）
+  - `main.cpp` — C++ 範例（包含迴圈與 std::sort）
+- `presets/*.yaml` — 預設的 `.clang-tidy` 範例檔案
 
 ## 先決條件
 - 已安裝 clang-tidy、Clang/LLVM 開發套件（headers & libs）以及 CMake。
@@ -39,81 +75,114 @@ cmake --build . --config Release
 ## 產生 .clang-tidy（題目自動化設定）
 可以使用 `scripts/generate_tidy_config.py` 由題目設定自動建立 `.clang-tidy`：
 
+### 基本用法
+
 ```bash
+# 只禁用迴圈
+python3 scripts/generate_tidy_config.py --forbid-loops
+
+# 禁用迴圈和陣列
 python3 scripts/generate_tidy_config.py --forbid-loops --forbid-arrays
+
+# 禁用 STL（C++ 專用）
+python3 scripts/generate_tidy_config.py --forbid-stl
+
+# 禁用特定函式（需同時指定 --forbid-functions）
+python3 scripts/generate_tidy_config.py --forbid-functions --function-names 'sort,printf,malloc'
+
+# 組合使用：禁用迴圈、陣列和 STL
+python3 scripts/generate_tidy_config.py --forbid-loops --forbid-arrays --forbid-stl
+
+# 完整組合（加上禁用函式）
+python3 scripts/generate_tidy_config.py --forbid-loops --forbid-arrays --forbid-stl --forbid-functions --function-names 'sort,printf'
+
+# 指定輸出目錄（預設為當前目錄）
+python3 scripts/generate_tidy_config.py --forbid-loops --output-dir examples
 ```
 
-會產生像這樣的 `.clang-tidy`：
+**生成範例：**
 
+只禁用迴圈：
 ```yaml
-Checks: 'misc-forbid-loops,misc-forbid-arrays'
+Checks: misc-forbid-loops
 WarningsAsErrors: '*'
 ```
+
+禁用函式：
+```yaml
+CheckOptions:
+- key: misc-forbid-functions.ForbiddenNames
+  value: sort,printf,malloc
+Checks: misc-forbid-functions
+WarningsAsErrors: '*'
+```
+
+> **重要：**`WarningsAsErrors: '*'` 會將所有警告轉換為錯誤，確保違規代碼無法通過檢查。
 
 這個步驟通常在 OJ 的題目設定階段由系統自動執行（出題者勾選要禁用的項目即可）。
 
 ## 執行 clang-tidy（範例）
-如果要針對單一檔案執行檢查（Unix-like 範例）：
+
+### 推薦方式：使用 .clang-tidy 配置檔
+
+先用腳本生成配置，clang-tidy 會自動讀取：
+
+```bash
+# 生成配置
+python3 scripts/generate_tidy_config.py --forbid-arrays
+
+# 執行檢查（不需指定 -checks）
+clang-tidy main.c \
+    -load ./build/libMiscTidyModule.so \
+    -export-fixes=fixes.yaml \
+    -- -std=c17
+```
+
+### 手動指定規則（不建議）
+
+如果要針對單一檔案執行檢查並手動指定規則：
 
 ```bash
 clang-tidy main.cpp \
-	-load ./build/libMiscTidyModule.so \
-	-checks='misc-forbid-loops,misc-forbid-arrays' \
-	-- -std=c++17
+    -load ./build/libMiscTidyModule.so \
+    -checks='misc-forbid-loops,misc-forbid-arrays' \
+    -- -std=c++17
 ```
 
-若要輸出 JSON（使用 `-export-fixes`，方便 OJ 後端解析）：
+### 輸出 YAML 格式的修復建議
+
+使用 `-export-fixes` 可生成 YAML 格式的診斷結果，方便 OJ 後端解析：
 
 ```bash
 clang-tidy main.c \
-	-load ./build/libMiscTidyModule.so \
-	-checks='misc-forbid-arrays' \
-	-export-fixes=result.json \
-	-- -std=c17
+    -load ./build/libMiscTidyModule.so \
+    -export-fixes=fixes.yaml \
+    -- -std=c17
 ```
 
-run_tidy.sh 是一個簡單的 wrapper（bash），可在類 Unix 環境下使用：
+**注意：** 程式退出時可能出現 `free(): invalid pointer` 或 `pure virtual method called` 錯誤，這是 LLVM 14.0.0 動態模組的已知問題，**不影響檢查功能和 YAML 輸出**。fixes.yaml 會正常生成。
 
-```bash
-./scripts/run_tidy.sh main.cpp ./build/libMiscTidyModule.so 'misc-forbid-loops' -- -std=c++17
-```
+## 輸出格式：YAML 診斷結果
 
-### Windows / PowerShell 注意事項
-- 如果在 Windows 原生環境（PowerShell / MSVC）編譯，模組可能輸出為 `.dll`：請把 `-load` 的路徑改為對應的 DLL（例如 `-load .\build\MiscTidyModule.dll`），並確認 clang-tidy 可載入該 DLL（路徑、符號導出等）。
-- `scripts/run_tidy.sh` 是 bash script；在 Windows 上可使用 WSL 或手動在 PowerShell 下撰寫等價指令：
+執行後 `-export-fixes=fixes.yaml` 會產生 YAML 格式的診斷結果：
 
-PowerShell 範例：
-
-```powershell
-# 編譯（假設使用 CMake + MSVC toolchain）
-mkdir build; cd build
-cmake ..
-cmake --build . --config Release
-
-# 執行 clang-tidy（調整 -load 路徑為 dll）
-clang-tidy ..\examples\main.cpp -load .\build\MiscTidyModule.dll -checks="misc-forbid-loops" -- -std=c++17
-```
-
-（注意：實際在 Windows 下可能需調整 CMakeLists 以正確 link 與匯出 DLL 符號，視 LLVM/Clang 的安裝方式而定。）
-
-## 範例：檢查與 JSON 輸出
-執行後 `-export-fixes=result.json` 會產生類似格式：
-
-```json
-{
-	"MainSourceFile": "main.c",
-	"Diagnostics": [
-		{
-			"DiagnosticName": "misc-forbid-arrays",
-			"Message": "Array declaration is forbidden.",
-			"FilePath": "main.c",
-			"FileOffset": 32
-		}
-	]
-}
+```yaml
+---
+MainSourceFile: "/path/to/main.c"
+Diagnostics:
+  - DiagnosticName: misc-forbid-arrays
+    DiagnosticMessage:
+      Message: Array declaration is forbidden.
+      FilePath: "/path/to/main.c"
+      FileOffset: 137
+      Replacements: []
+    Level: Warning
+    BuildDirectory: "/path/to/project"
 ```
 
 OJ 系統可以解析 `Diagnostics` 陣列來決定要回傳給學生的錯誤訊息與位置。
+
+> **注意：** 由於 `WarningsAsErrors: '*'` 的設定，所有 Warning 都會被視為 Error，確保違規代碼無法通過。
 
 ## 範例程式測試
 
@@ -126,15 +195,19 @@ OJ 系統可以解析 `Diagnostics` 陣列來決定要回傳給學生的錯誤�
 ### 測試 main.c（禁用陣列）
 
 ```bash
+# 生成只禁用陣列的配置
+python3 scripts/generate_tidy_config.py --forbid-arrays
+
+# 執行檢查
 clang-tidy examples/main.c \
   -load ./build/libMiscTidyModule.so \
-  -checks='misc-forbid-arrays' \
-  -export-fixes=main_c_result.json \
+  -export-fixes=main_c_result.yaml \
   -- -std=c17
 ```
 
 **預期輸出：**
-```
+
+```text
 examples/main.c:6:9: error: Array declaration is forbidden. [misc-forbid-arrays]
     int numbers[5] = {1, 2, 3, 4, 5};
         ^
@@ -143,16 +216,19 @@ examples/main.c:6:9: error: Array declaration is forbidden. [misc-forbid-arrays]
 ### 測試 main.cpp（禁用迴圈與函式）
 
 ```bash
+# 生成配置
+python3 scripts/generate_tidy_config.py --forbid-loops --forbid-functions --function-names 'sort'
+
+# 執行檢查
 clang-tidy examples/main.cpp \
   -load ./build/libMiscTidyModule.so \
-  -checks='misc-forbid-loops,misc-forbid-functions' \
-  -config="{CheckOptions: [{key: misc-forbid-functions.ForbiddenNames, value: 'sort'}]}" \
-  -export-fixes=main_cpp_result.json \
+  -export-fixes=main_cpp_result.yaml \
   -- -std=c++17
 ```
 
 **預期輸出：**
-```
+
+```text
 examples/main.cpp:10:10: error: Use of forbidden function 'sort' [misc-forbid-functions]
     std::sort(data.begin(), data.end());
          ^
@@ -163,35 +239,28 @@ examples/main.cpp:13:5: error: Loop statements (for/while/do) are forbidden. [mi
 
 ### 使用 .clang-tidy 設定檔
 
-`examples/.clang-tidy` 已經設定好所有檢查與選項：
+可以在特定目錄生成配置檔，clang-tidy 會自動讀取：
+
+```bash
+# 為 examples 目錄生成配置
+python3 scripts/generate_tidy_config.py --forbid-loops --forbid-arrays --forbid-functions --function-names 'sort,printf,malloc' --output-dir examples
+
+# 在 examples 目錄下執行
+cd examples
+clang-tidy main.cpp -load ../build/libMiscTidyModule.so -export-fixes=result.yaml -- -std=c++17
+```
+
+生成的 `.clang-tidy` 範例：
 
 ```yaml
-Checks: 'misc-forbid-loops,misc-forbid-arrays,misc-forbid-functions'
-WarningsAsErrors: '*'
 CheckOptions:
-  - key: misc-forbid-functions.ForbiddenNames
-    value: 'sort,printf,malloc'
+- key: misc-forbid-functions.ForbiddenNames
+  value: sort,printf,malloc
+Checks: misc-forbid-loops,misc-forbid-arrays,misc-forbid-functions
+WarningsAsErrors: '*'
 ```
 
-在 `examples/` 目錄下執行：
-
-```bash
-cd examples
-clang-tidy main.cpp -load ../build/libMiscTidyModule.so -export-fixes=result.json -- -std=c++17
-```
-
-clang-tidy 會自動讀取 `.clang-tidy` 設定並套用所有檢查規則。
-
-### 一鍵測試腳本
-
-也可使用 `scripts/test_examples.sh`（bash）：
-
-```bash
-chmod +x scripts/test_examples.sh
-./scripts/test_examples.sh
-```
-
-腳本會依序測試 `main.c` 與 `main.cpp` 並產生 JSON 輸出。
+clang-tidy 會自動讀取該目錄的 `.clang-tidy` 設定並套用所有檢查規則。
 
 ## 自訂禁用函式清單
 
@@ -207,15 +276,49 @@ CheckOptions:
 
 ## 常見問題
 
-**Q：為什麼在 Windows 下無法載入 `.dll`？**  
-A：可能是 CMake 沒有正確匯出符號、或 clang-tidy 期待不同的 ABI/CRT。常見做法是使用 WSL 或 Linux 容器來避免這些差異。
+**Q：為什麼程式退出時出現 `free(): invalid pointer` 或 `pure virtual method called` 錯誤？**  
+A：這是 LLVM 14.0.0 動態載入模組的已知 bug，發生在程式退出卸載模組時。**這不影響檢查功能和輸出文件生成**，fixes.yaml 會正常產生，可以安全忽略這個錯誤。建議升級到 LLVM 15+ 以解決此問題，或在 OJ 系統中使用 `2>/dev/null || true` 抑制錯誤輸出。
 
 **Q：如何在 OJ 系統中整合？**  
 A：
+
 1. 在題目設定介面讓出題者勾選要禁用的項目（迴圈/陣列/函式）
 2. 系統呼叫 `generate_tidy_config.py` 產生 `.clang-tidy`
-3. 在判題容器中執行 `clang-tidy` 並傳入 `-export-fixes=result.json`
-4. 解析 JSON 的 `Diagnostics` 陣列，將錯誤訊息回傳給學生
+3. 在判題容器中執行 `clang-tidy` 並傳入 `-export-fixes=fixes.yaml`
+4. 解析 YAML 的 `Diagnostics` 陣列，將錯誤訊息回傳給學生
+
+範例整合腳本：
+
+```bash
+#!/bin/bash
+# OJ 判題腳本範例
+python3 scripts/generate_tidy_config.py --forbid-loops --forbid-arrays
+clang-tidy student_code.c \
+    -load ./build/libMiscTidyModule.so \
+    -export-fixes=fixes.yaml \
+    -- -std=c17 2>/dev/null || true
+
+# 檢查是否有違規
+if [ -f fixes.yaml ] && grep -q "DiagnosticName:" fixes.yaml; then
+    echo "靜態檢查失敗：代碼違反題目限制"
+    python3 parse_diagnostics.py fixes.yaml
+    exit 1
+fi
+```
 
 **Q：可以檢查 C 和 C++ 嗎？**  
-A：可以。記得在編譯參數中指定正確的標準（`-std=c17` 或 `-std=c++17`）。
+A：可以。記得在編譯參數中指定正確的標準（`-std=c17` 或 `-std=c++17`）。注意 `misc-forbid-stl` 僅適用於 C++ 程式碼。
+
+**Q：如何只禁用迴圈而不禁用函式？**  
+A：使用 `--forbid-loops` 參數生成配置即可。只有在指定 `--forbid-functions` 時才會啟用函式檢查：
+
+```bash
+python3 scripts/generate_tidy_config.py --forbid-loops
+```
+
+**Q：STL 檢查會禁止哪些內容？**  
+A：`misc-forbid-stl` 會禁止所有 `std::` 命名空間下的內容，包括：
+- 容器：`std::vector`、`std::string`、`std::map`、`std::set` 等
+- 算法：`std::sort`、`std::find`、`std::copy` 等
+- I/O：`std::cout`、`std::cin`、`std::endl` 等
+- 其他：`std::function`、`std::shared_ptr` 等所有 STL 組件

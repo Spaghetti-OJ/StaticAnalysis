@@ -23,6 +23,7 @@ set(SRC
   src/ForbidLoopsCheck.cpp
   src/ForbidArraysCheck.cpp
   src/ForbidFunctionsCheck.cpp
+  src/ForbidSTLCheck.cpp
   src/RegisterModule.cpp
 )
 

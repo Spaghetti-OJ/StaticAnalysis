@@ -1,2 +1,2 @@
-Checks: misc-forbid-loops
+Checks: misc-forbid-stl
 WarningsAsErrors: '*'

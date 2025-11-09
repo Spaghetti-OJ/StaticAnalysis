@@ -17,10 +17,14 @@ signed main() {
 	
 	int n;
 	cin >> n;
+	vector<int> v;
+	set<int> st;
 	while(n--) {
 		int a;
 		cin >> a;
 		a++;
+		v.push_back(a);
+		st.insert(a);
 		while(!isPrim(a)) {
 			a++;
 		} 
