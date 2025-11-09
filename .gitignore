@@ -1,0 +1,9 @@
+build/
+*.so
+*.dll
+*.json
+*.yaml
+*.yml
+*.cache
+*.pyc
+__pycache__/

@@ -1,0 +1,5 @@
+CheckOptions:
+- key: misc-forbid-functions.ForbiddenNames
+  value: sort,printf
+Checks: misc-forbid-loops,misc-forbid-arrays,misc-forbid-functions
+WarningsAsErrors: '*'
