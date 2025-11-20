@@ -1,0 +1,2 @@
+Checks: 'misc-forbid-loops,misc-forbid-arrays'
+WarningsAsErrors: '*'

@@ -7,3 +7,8 @@ build/
 *.cache
 *.pyc
 __pycache__/
+!presets/*.yaml
+
+# API 相關
+api/database.db
+api/*.log
