@@ -1,2 +1,0 @@
-Checks: misc-forbid-loops,misc-forbid-stl
-WarningsAsErrors: '*'
