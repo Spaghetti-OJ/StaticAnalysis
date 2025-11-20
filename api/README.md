@@ -138,40 +138,6 @@ pip install gunicorn uvicorn
 gunicorn -w 4 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 api.app:app
 ```
 
-### 使用 Docker
-
-```dockerfile
-FROM python:3.11-slim
-
-# 安裝 LLVM 和 clang-tidy
-RUN apt-get update && apt-get install -y \
-    clang-tidy llvm cmake build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-COPY . .
-
-RUN pip install -r requirements.txt
-RUN mkdir -p build && cd build && cmake .. && cmake --build .
-
-EXPOSE 5000
-CMD ["uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "5000"]
-```
-
-### Nginx 反向代理
-
-```nginx
-server {
-    listen 80;
-    server_name your-domain.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:5000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
-```
 
 ## 安全性注意事項
 

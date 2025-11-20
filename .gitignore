@@ -1,6 +1,7 @@
-build/
+build/*
 *.so
 *.dll
+!build/libMiscTidyModule.so
 *.json
 *.yaml
 *.yml
@@ -12,3 +13,5 @@ __pycache__/
 # API 相關
 api/database.db
 api/*.log
+
+configs/
