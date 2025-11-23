@@ -1,496 +1,416 @@
-#!/usr/bin/env python3
-"""
-Clang-Tidy Static Analysis API Server (FastAPI)
-提供靜態分析功能的 FastAPI 版本
-"""
-
-from fastapi import FastAPI, Depends, Header, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import subprocess
+from fastapi import FastAPI, HTTPException, File, Form, UploadFile, Depends, Header, status
+from fastapi.security import APIKeyHeader
+from fastapi.responses import HTMLResponse
+from pydantic import ValidationError
+from typing import Optional
+from contextlib import asynccontextmanager
+import logging
 import json
-import yaml
-import tempfile
+import asyncio
+import os
+import hashlib
 import shutil
-from pathlib import Path
-import sqlite3
-from datetime import datetime
+import aiofiles
+import time
+import glob
+from logging.handlers import TimedRotatingFileHandler
 
-app = FastAPI(title="Clang-Tidy API", version="1.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from models import SubmissionRequest, LimitObject, Job
+from queue_manager import job_queue
+from worker import worker_manager
+
+# 設定日誌
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "sandbox.log")
+
+handler = TimedRotatingFileHandler(
+    log_file, 
+    when="midnight", 
+    interval=1, 
+    backupCount=30, 
+    encoding='utf-8'
+)
+handler.suffix = "%Y-%m-%d"
+
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        handler,
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await worker_manager.start()
+    yield
+    # Shutdown
+    await worker_manager.stop()
+
+app = FastAPI(
+    title="Sandbox Isolate API",
+    version="2.0.0",
+    description="非同步 Isolate 沙盒評測服務",
+    lifespan=lifespan
 )
 
-# 配置
-BASE_DIR = Path(__file__).parent.parent
-BUILD_DIR = BASE_DIR / "build"
-MODULE_PATH = BUILD_DIR / "libMiscTidyModule.so"
-SCRIPT_PATH = BASE_DIR / "scripts" / "generate_tidy_config.py"
-CONFIG_DIR = BASE_DIR / "configs"
-DB_PATH = BASE_DIR / "api" / "database.db"
+# ===== Security =====
+API_KEY_NAME = "X-API-KEY"
+API_KEY = os.getenv("SANDBOX_API_KEY", "default-insecure-key") # 建議在環境變數中設定
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
-# 確保目錄存在
-CONFIG_DIR.mkdir(exist_ok=True)
-(BASE_DIR / "api").mkdir(exist_ok=True)
+async def verify_api_key(api_key: str = Depends(api_key_header)):
+    """驗證 API Key"""
+    if api_key != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Could not validate credentials"
+        )
+    return api_key
 
+# ===== API Endpoints =====
 
-def init_db():
-    """初始化資料庫"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+@app.post("/api/v1/submissions", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(verify_api_key)])
+async def submit_job(
+    submission_id: str = Form(..., description="唯一的提交 ID"),
+    problem_id: str = Form(..., description="題目 ID"),
+    mode: str = Form(..., description="模式: zip | normal", regex="^(zip|normal)$"),
+    language: str = Form(..., description="程式語言: c, cpp, python, java, go"),
     
-    # submissions 表
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS submissions (
-            id INTEGER PRIMARY KEY,
-            problem_id INTEGER NOT NULL,
-            code TEXT NOT NULL,
-            language TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            user_id INTEGER
-        )
-    ''')
+    file: UploadFile = File(..., description="程式碼檔案或 ZIP"),
+    file_hash: str = Form(..., description="檔案 SHA256 Hash"),
     
-    # requirements 表
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS requirements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            problem_id INTEGER NOT NULL UNIQUE,
-            rules TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    ''')
+    time_limit: float = Form(2.0, description="CPU 時間限制 (秒)"),
+    memory_limit: int = Form(256000, description="記憶體限制 (KB)"),
     
-    # lint_runs 表
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS lint_runs (
-            id TEXT PRIMARY KEY,
-            submission_id INTEGER NOT NULL,
-            problem_id INTEGER NOT NULL,
-            status TEXT NOT NULL,
-            violations_count INTEGER,
-            fixes_available BOOLEAN,
-            created_at TEXT NOT NULL,
-            completed_at TEXT,
-            error_message TEXT
-        )
-    ''')
+    use_checker: bool = Form(False, description="是否使用 Checker"),
+    checker_file: Optional[UploadFile] = File(None, description="Checker 執行檔"),
     
-    # lint_reports 表
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS lint_reports (
-            id TEXT PRIMARY KEY,
-            submission_id INTEGER NOT NULL,
-            problem_id INTEGER NOT NULL,
-            run_id TEXT NOT NULL,
-            passed BOOLEAN NOT NULL,
-            violations TEXT NOT NULL,
-            total_violations INTEGER NOT NULL,
-            execution_time_ms INTEGER,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (run_id) REFERENCES lint_runs(id)
-        )
-    ''')
+    use_static_analysis: bool = Form(False, description="是否使用靜態分析"),
+    static_analysis_file: Optional[UploadFile] = File(None, description="靜態分析設定檔或執行檔"),
     
-    conn.commit()
-    conn.close()
+    callback_url: Optional[str] = Form(None, description="Webhook URL"),
+    priority: int = Form(10, description="優先級"),
+    stdin: Optional[str] = Form(None, description="標準輸入 (Stdin)"),
+):
+    """
+    提交評測任務 (Async V2) - Aligned with User Spec
+    """
+    # 0. Log 接收到的請求
+    logger.info(f"Received submission {submission_id}: problem={problem_id}, lang={language}, mode={mode}, priority={priority}")
 
-
-def auth_dependency(authorization: str | None = Header(default=None)):
-    """簡易認證依賴（示範用）。"""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="unauthorized.")
-    # TODO: 驗證 token
-    return True
-
-
-def permission_dependency(_: bool = Depends(auth_dependency)):
-    """簡易權限依賴（示範用）。"""
-    # TODO: 實作權限檢查
-    return True
-
-
-# ======== Pydantic models ========
-
-class RequirementsBody(BaseModel):
-    problem_id: int
-    rules: list[str]
-
-
-class GenerateBody(BaseModel):
-    problem_id: int
-    rules: list[str]
-    language_type: int | None = 1
-
-
-class RunBody(BaseModel):
-    submission_id: int
-    problem_id: int
-    language_type: int | None = 1
-    timeout_sec: int | None = 30
-    export_fixes: bool | None = True
-
-
-class ReportResult(BaseModel):
-    passed: bool
-    violations: list[dict] = []
-    total_violations: int = 0
-    execution_time_ms: int | None = None
-
-
-class ReportBody(BaseModel):
-    submission_id: int
-    problem_id: int
-    run_id: str
-    result: ReportResult
-
-
-class CreateSubmissionBody(BaseModel):
-    problem_id: int
-    code: str
-    language: str = "cpp"
-
-
-# ==================== API 端點 ====================
-
-@app.get('/submission/{submission_id}')
-def get_submission(submission_id: int, _auth: bool = Depends(auth_dependency)):
-    """1. GET /submission/<submission> – 取得使用者提交程式碼"""
+    # 1. 建立暫存目錄
+    upload_dir = f"/tmp/sandbox/submissions/{submission_id}"
+    os.makedirs(upload_dir, exist_ok=True)
+    
+    # 2. 儲存主檔案
+    file_path = os.path.join(upload_dir, file.filename)
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            '''
-            SELECT id, problem_id, code, language, created_at
-            FROM submissions WHERE id = ?
-            ''',
-            (submission_id,)
-        )
-        
-        row = c.fetchone()
-        conn.close()
-        
-        if not row:
-            raise HTTPException(status_code=404, detail="submission not found.")
-
-        return {
-            "submission_id": row[0],
-            "problem_id": row[1],
-            "code": row[2],
-            "language": row[3],
-            "created_at": row[4],
-        }
-    except HTTPException:
-        raise
+        async with aiofiles.open(file_path, 'wb') as out_file:
+            content = await file.read()
+            await out_file.write(content)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
 
+    # 3. 驗證 Hash
+    sha256_hash = hashlib.sha256(content).hexdigest()
+    if sha256_hash != file_hash:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"File hash mismatch. Expected {file_hash}, got {sha256_hash}")
 
-@app.post('/lint/requirements')
-def save_requirements(body: RequirementsBody, _perm: bool = Depends(permission_dependency)):
-    """2. POST /lint/requirements – 提交出題者需求"""
+    # 4. 儲存 Optional Files
+    checker_path = None
+    if use_checker and checker_file:
+        checker_path = os.path.join(upload_dir, checker_file.filename)
+        async with aiofiles.open(checker_path, 'wb') as out_file:
+            await out_file.write(await checker_file.read())
+            
+    static_analysis_path = None
+    if use_static_analysis and static_analysis_file:
+        static_analysis_path = os.path.join(upload_dir, static_analysis_file.filename)
+        async with aiofiles.open(static_analysis_path, 'wb') as out_file:
+            await out_file.write(await static_analysis_file.read())
+
+    # 5. 建構 Request Data (For backward compatibility / internal use)
+    limits = LimitObject(
+        time_limit_sec=time_limit,
+        memory_limit_kb=memory_limit,
+        wall_time_limit_sec=time_limit * 2.5 # Default heuristic
+    )
+    
+    request_data = SubmissionRequest(
+        submission_id=submission_id,
+        code="<FILE_UPLOADED>", 
+        language=language,
+        priority=priority,
+        limits=limits,
+        callback_url=callback_url
+    )
+
+    # 6. 建立 Job
+    job = Job(
+        submission_id=submission_id,
+        language=language,
+        priority=priority,
+        timestamp=time.time(),
+        request_data=request_data,
+        
+        problem_id=problem_id,
+        mode=mode,
+        file_path=file_path,
+        file_hash=file_hash,
+        
+        use_checker=use_checker,
+        checker_file_path=checker_path,
+        
+        use_static_analysis=use_static_analysis,
+        static_analysis_file_path=static_analysis_path,
+        
+        stdin=stdin
+    )
+
+    # 7. 推入隊列
     try:
-        problem_id = body.problem_id
-        rules = body.rules or []
-        if not problem_id or not rules:
-            raise HTTPException(status_code=400, detail="invalid rules format.")
-        
-        # 驗證規則格式
-        valid_rules = ['--forbid-loops', '--forbid-arrays', '--forbid-stl']
-        for rule in rules:
-            if not any(rule.startswith(vr) or rule == vr for vr in valid_rules + ['--forbid-functions=']):
-                raise HTTPException(status_code=400, detail=f"invalid rule: {rule}")
-        
-        # 儲存到資料庫
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        now = datetime.now().isoformat()
-        
-        c.execute('''
-            INSERT OR REPLACE INTO requirements (problem_id, rules, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
-        ''', (problem_id, json.dumps(rules), now, now))
-        
-        config_id = f"cfg_{problem_id}"
-        conn.commit()
-        conn.close()
-        
-        return {
-            "message": "requirements saved.",
-            "config_id": config_id,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post('/lint/generate')
-def generate_config(body: GenerateBody, _perm: bool = Depends(permission_dependency)):
-    """3. POST /lint/generate – 生成 .clang-tidy 檔案"""
-    try:
-        problem_id = body.problem_id
-        rules = body.rules or []
-        if not problem_id or not rules:
-            raise HTTPException(status_code=400, detail="missing problem_id or rules.")
-        
-        # 建立題目配置目錄
-        problem_config_dir = CONFIG_DIR / f"problem_{problem_id}"
-        problem_config_dir.mkdir(exist_ok=True)
-        
-        # 轉換規則為腳本參數
-        script_args = ['python3', str(SCRIPT_PATH)]
-        for rule in rules:
-            if rule.startswith('--forbid-functions='):
-                script_args.append('--forbid-functions')
-                funcs = rule.split('=')[1]
-                script_args.extend(['--function-names', funcs])
-            else:
-                script_args.append(rule)
-        
-        script_args.extend(['--output-dir', str(problem_config_dir)])
-        
-        # 執行生成腳本
-        result = subprocess.run(
-            script_args,
-            capture_output=True,
-            text=True,
-            cwd=BASE_DIR,
+        await job_queue.push(job)
+        logger.info(f"Job {submission_id} added to queue (Position: {job_queue.size()})")
+    except asyncio.QueueFull:
+        logger.warning(f"Job queue full, rejected {submission_id}")
+        # Cleanup on failure
+        shutil.rmtree(upload_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="系統忙碌中，請稍後再試 (Queue Full)"
         )
 
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail=f"generation failed: {result.stderr}")
-        
-        # 讀取生成的配置
-        config_path = problem_config_dir / ".clang-tidy"
-        with open(config_path, 'r') as f:
-            config_content = f.read()
-        
-        return {
-            "message": f"Generated .clang-tidy for problem {problem_id}",
-            "config_path": str(config_path),
-            "config_content": config_content,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post('/lint/run')
-def run_lint(body: RunBody):
-    """4. POST /lint/run – 執行 Clang-Tidy 檢查"""
-    try:
-        submission_id = body.submission_id
-        problem_id = body.problem_id
-        language_type = body.language_type or 1  # 0=C, 1=C++
-        timeout_sec = body.timeout_sec or 30
-        export_fixes = True if body.export_fixes is None else body.export_fixes
-
-        if not submission_id or not problem_id:
-            raise HTTPException(status_code=400, detail="invalid submission_id or missing code.")
-        
-        # 取得提交程式碼
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('SELECT code, language FROM submissions WHERE id = ?', (submission_id,))
-        row = c.fetchone()
-        
-        if not row:
-            conn.close()
-            raise HTTPException(status_code=404, detail="submission not found.")
-        
-        code, language = row
-        
-        # 建立 run 記錄
-        run_id = f"run_{submission_id}_{int(datetime.now().timestamp())}"
-        now = datetime.now().isoformat()
-        c.execute('''
-            INSERT INTO lint_runs (id, submission_id, problem_id, status, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (run_id, submission_id, problem_id, 'running', now))
-        conn.commit()
-        
-        # 建立臨時工作目錄
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir_path = Path(tmpdir)
-            
-            # 決定檔案副檔名
-            ext = '.c' if language_type == 0 else '.cpp'
-            code_file = tmpdir_path / f"code{ext}"
-            code_file.write_text(code)
-            
-            # 複製 .clang-tidy 配置
-            config_src = CONFIG_DIR / f"problem_{problem_id}" / ".clang-tidy"
-            if config_src.exists():
-                shutil.copy(config_src, tmpdir_path / ".clang-tidy")
-            
-            # 準備 clang-tidy 命令
-            std_flag = '-std=c17' if language_type == 0 else '-std=c++17'
-            fixes_file = tmpdir_path / "fixes.yaml"
-            
-            cmd = [
-                'clang-tidy',
-                str(code_file),
-                '-load', str(MODULE_PATH),
-            ]
-            
-            if export_fixes:
-                cmd.extend(['-export-fixes', str(fixes_file)])
-            
-            cmd.extend(['--', std_flag])
-            
-            # 執行 clang-tidy
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-                cwd=tmpdir_path,
-            )
-            
-            # 解析結果
-            violations_count = 0
-            fixes_available = False
-            
-            if export_fixes and fixes_file.exists():
-                with open(fixes_file, 'r') as f:
-                    fixes_data = yaml.safe_load(f)
-                    if fixes_data and 'Diagnostics' in fixes_data:
-                        violations_count = len(fixes_data['Diagnostics'])
-                        fixes_available = True
-            
-            # 更新 run 記錄
-            status = 'finished' if result.returncode in [0, 1] else 'failed'
-            c.execute('''
-                UPDATE lint_runs
-                SET status = ?, violations_count = ?, fixes_available = ?,
-                    completed_at = ?, error_message = ?
-                WHERE id = ?
-            ''', (status, violations_count, fixes_available, datetime.now().isoformat(),
-                  result.stderr if status == 'failed' else None, run_id))
-            conn.commit()
-        
-        conn.close()
-        
-        return {
-            "message": "clang-tidy completed.",
-            "run_id": run_id,
-            "status": status,
-            "violations_count": violations_count,
-            "fixes_available": fixes_available,
-        }
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="clang-tidy timeout.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"clang-tidy runtime error: {str(e)}")
-
-
-@app.post('/lint/report')
-def save_report(body: ReportBody, _perm: bool = Depends(permission_dependency)):
-    """5. POST /lint/report – 儲存靜態分析結果"""
-    try:
-        submission_id = body.submission_id
-        problem_id = body.problem_id
-        run_id = body.run_id
-        result = body.result
-        
-        if not all([submission_id, problem_id, run_id, result]):
-            raise HTTPException(status_code=400, detail="invalid report format.")
-        
-        # 儲存報告
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        report_id = f"rpt_{submission_id}_{int(datetime.now().timestamp())}"
-        now = datetime.now().isoformat()
-        
-        c.execute('''
-            INSERT INTO lint_reports 
-            (id, submission_id, problem_id, run_id, passed, violations, 
-             total_violations, execution_time_ms, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            report_id, submission_id, problem_id, run_id,
-            bool(result.passed),
-            json.dumps(result.violations or []),
-            int(result.total_violations or 0),
-            result.execution_time_ms,
-            now
-        ))
-        
-        conn.commit()
-        conn.close()
-        
-        return {
-            "message": "report saved.",
-            "report_id": report_id,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ==================== 輔助端點 ====================
-
-@app.post('/submission', status_code=201)
-def create_submission(body: CreateSubmissionBody):
-    """建立新的提交（測試用）"""
-    try:
-        code = body.code
-        problem_id = body.problem_id
-        language = body.language or 'cpp'
-
-        if not code or not problem_id:
-            raise HTTPException(status_code=400, detail="missing code or problem_id.")
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        now = datetime.now().isoformat()
-        
-        c.execute('''
-            INSERT INTO submissions (problem_id, code, language, created_at)
-            VALUES (?, ?, ?, ?)
-        ''', (problem_id, code, language, now))
-        
-        submission_id = c.lastrowid
-        conn.commit()
-        conn.close()
-        
-        return {
-            "message": "submission created.",
-            "submission_id": submission_id,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get('/health')
-def health_check():
-    """健康檢查"""
     return {
-        "status": "healthy",
-        "module_exists": MODULE_PATH.exists(),
-        "script_exists": SCRIPT_PATH.exists(),
+        "success": True,
+        "submission_id": submission_id,
+        "status": "queued",
+        "queue_position": job_queue.size()
     }
 
+@app.post("/api/v1/test_local/{problem_id}", dependencies=[Depends(verify_api_key)])
+async def test_local_problem(problem_id: str):
+    """
+    測試本地題目 (Dev Only)
+    讀取 test_data/problems/{problem_id} 下的 solution.py 與 test cases
+    """
+    problem_dir = os.path.join("test_data", "problems", problem_id)
+    if not os.path.exists(problem_dir):
+        raise HTTPException(status_code=404, detail=f"Problem {problem_id} not found")
 
-@app.on_event("startup")
-def on_startup():
-    init_db()
-    print(f"✅ Database initialized at {DB_PATH}")
-    print(f"✅ Module path: {MODULE_PATH}")
-    print(f"✅ Script path: {SCRIPT_PATH}")
-    print(f"✅ Config directory: {CONFIG_DIR}")
+    solution_path = os.path.join(problem_dir, "solution.py")
+    if not os.path.exists(solution_path):
+        raise HTTPException(status_code=404, detail="solution.py not found")
 
+    # Read solution code
+    async with aiofiles.open(solution_path, "r", encoding="utf-8") as f:
+        code_content = await f.read()
+    
+    # Find test cases
+    input_files = sorted(glob.glob(os.path.join(problem_dir, "*.in")))
+    
+    results = []
+    
+    for input_file in input_files:
+        test_case_name = os.path.basename(input_file).replace(".in", "")
+        output_file = input_file.replace(".in", ".out")
+        
+        expected_output = None
+        if os.path.exists(output_file):
+            async with aiofiles.open(output_file, "r", encoding="utf-8") as f:
+                expected_output = await f.read()
+        
+        stdin_content = None
+        async with aiofiles.open(input_file, "r", encoding="utf-8") as f:
+            stdin_content = await f.read()
+
+        submission_id = f"test-{problem_id}-{test_case_name}-{int(time.time())}"
+        
+        # Create Job directly
+        # Note: We skip the file upload part for local testing and just use the code content
+        # But Worker expects a file path. So we mock it or create a temp file.
+        # Let's create a temp file to be consistent with Worker logic.
+        
+        upload_dir = f"/tmp/sandbox/submissions/{submission_id}"
+        os.makedirs(upload_dir, exist_ok=True)
+        file_path = os.path.join(upload_dir, "solution.py")
+        async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
+            await f.write(code_content)
+            
+        file_hash = hashlib.sha256(code_content.encode()).hexdigest()
+        
+        limits = LimitObject(
+            time_limit_sec=2.0,
+            memory_limit_kb=256000,
+            wall_time_limit_sec=5.0
+        )
+        
+        request_data = SubmissionRequest(
+            submission_id=submission_id,
+            code=code_content,
+            language="python",
+            priority=10,
+            limits=limits
+        )
+        
+        job = Job(
+            submission_id=submission_id,
+            language="python",
+            priority=10,
+            timestamp=time.time(),
+            request_data=request_data,
+            problem_id=problem_id,
+            mode="normal",
+            file_path=file_path,
+            file_hash=file_hash,
+            stdin=stdin_content,
+            expected_output=expected_output
+        )
+        
+        await job_queue.push(job)
+        results.append(submission_id)
+        
+    return {
+        "message": f"Triggered {len(results)} tests for {problem_id}",
+        "submission_ids": results
+    }
+
+@app.get("/api/v1/submissions/{submission_id}")
+async def get_submission_result(submission_id: str):
+    """
+    查詢特定提交的結果
+    """
+    # 1. 搜尋歷史紀錄 (已完成的任務)
+    for job in worker_manager.history:
+        if job["submission_id"] == submission_id:
+            return job
+    
+    # 2. 搜尋正在執行的任務
+    for worker in worker_manager.workers:
+        if worker.current_job and worker.current_job.submission_id == submission_id:
+            return {
+                "submission_id": submission_id,
+                "status": "processing",
+                "message": "Job is currently running"
+            }
+            
+    # 3. 搜尋佇列中的任務 (尚未開始)
+    # 這邊需要遍歷 queue，但 asyncio.Queue 不容易遍歷，暫時略過或假設在 queue 中
+    # 簡單回傳 404 代表 "Not Found in History or Active" -> 可能還在 Queue 或 ID 錯誤
+    
+    raise HTTPException(status_code=404, detail="Submission not found (might be queued or invalid ID)")
+
+@app.get("/health")
+async def health():
+    status_data = worker_manager.get_status()
+    return {
+        "status": "ok", 
+        "queue_size": job_queue.size(),
+        "service": "sandbox-isolate-api-v2",
+        "workers": status_data
+    }
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    """即時監控儀表板"""
+    if os.path.exists("dashboard.html"):
+        with open("dashboard.html", "r", encoding="utf-8") as f:
+            return f.read()
+    return "Dashboard not found"
+
+@app.get("/logs/view", response_class=HTMLResponse)
+async def view_logs():
+    """即時 Log 檢視頁面"""
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Sandbox Live Logs</title>
+        <meta charset="utf-8">
+        <style>
+            body { background-color: #1e1e1e; color: #d4d4d4; font-family: 'Consolas', 'Monaco', monospace; margin: 0; padding: 20px; font-size: 14px; }
+            h1 { font-size: 18px; margin-bottom: 10px; color: #569cd6; }
+            #controls { margin-bottom: 10px; position: sticky; top: 0; background: #1e1e1e; padding: 10px 0; border-bottom: 1px solid #333; }
+            button { background: #0e639c; color: white; border: none; padding: 5px 10px; cursor: pointer; }
+            button:hover { background: #1177bb; }
+            #log-container { white-space: pre-wrap; word-wrap: break-word; }
+            .error { color: #f48771; }
+            .info { color: #d4d4d4; }
+            .warning { color: #cca700; }
+        </style>
+    </head>
+    <body>
+        <div id="controls">
+            <h1>Sandbox Live Logs</h1>
+            <button onclick="fetchLogs()">Refresh Now</button>
+            <span id="status" style="margin-left: 10px; font-size: 12px; color: #888;">Auto-refreshing every 2s...</span>
+            <div id="debug-info" style="font-size: 10px; color: #666; margin-top: 5px;"></div>
+        </div>
+        <div id="log-container">Loading...</div>
+        <script>
+            const logContainer = document.getElementById('log-container');
+            const debugInfo = document.getElementById('debug-info');
+            let isScrolledToBottom = true;
+
+            window.onscroll = function() {
+                isScrolledToBottom = (window.innerHeight + window.scrollY) >= document.body.offsetHeight - 50;
+            };
+
+            async function fetchLogs() {
+                try {
+                    const response = await fetch('/logs/raw?t=' + new Date().getTime());
+                    if (!response.ok) throw new Error("Failed to fetch: " + response.status);
+                    const text = await response.text();
+                    logContainer.textContent = text;
+                    
+                    if (isScrolledToBottom) {
+                        window.scrollTo(0, document.body.scrollHeight);
+                    }
+                    document.getElementById('status').textContent = "Last updated: " + new Date().toLocaleTimeString();
+                    debugInfo.textContent = "Length: " + text.length + " chars";
+                } catch (e) {
+                    document.getElementById('status').textContent = "Error: " + e.message;
+                }
+            }
+            
+            // Initial load
+            fetchLogs();
+            // Auto refresh
+            setInterval(fetchLogs, 2000);
+        </script>
+    </body>
+    </html>
+    """
+    return html_content
+
+@app.get("/logs/raw")
+async def get_raw_logs():
+    """獲取原始 Log 內容"""
+    abs_log_file = os.path.abspath(log_file)
+    if not os.path.exists(abs_log_file):
+        # Debug info if file not found
+        return f"Log file not found at {abs_log_file}.\nCWD: {os.getcwd()}\nLS logs/: {os.listdir('logs') if os.path.exists('logs') else 'logs dir missing'}"
+    
+    try:
+        # Use standard open to ensure we get content and avoid async locking issues if any
+        with open(abs_log_file, mode='r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            if not content:
+                return f"Log file exists at {abs_log_file} but is empty."
+            return content
+    except Exception as e:
+        return f"Error reading log file: {str(e)}"
+
+@app.get("/")
+async def root():
+    return {
+        "service": app.title, 
+        "version": app.version,
+        "endpoints": ["/health", "/api/v1/submissions", "/dashboard"]
+    }

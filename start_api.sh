@@ -26,5 +26,5 @@ pip install -r requirements.txt
 # 啟動伺服器
 echo ""
 echo "🚀 Starting API server (uvicorn)..."
-uvicorn api.app:app --host 0.0.0.0 --port 5000 --reload
+uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
 echo "API server started."
