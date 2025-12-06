@@ -28,8 +28,10 @@ cat fixes.yaml
 - 禁用陣列（`misc-forbid-arrays`）：任何陣列型別的宣告
 - 禁用函式（`misc-forbid-functions`）：可配置禁用函式清單（如 `sort`、`printf`、`malloc`）
 - 禁用 STL（`misc-forbid-stl`）：禁止使用 C++ 標準模板庫（std::vector、std::string、std::cout 等）
+- 命名規範（`readability-identifier-naming`）：可指定函式/變數/類別/參數/列舉常數的命名風格
+- 多餘 include 檢查（`misc-include-cleaner`）：避免未使用的標頭
 - 支援輸出 YAML 格式的診斷結果（可供 OJ 系統解析）
-- 所有警告自動轉換為錯誤（`WarningsAsErrors: '*'`）
+- 自訂 `misc-forbid-*` 規則會被視為錯誤，新增的內建規則維持警告（`WarningsAsErrors: misc-forbid-*`）
 
 ## 檔案一覽
 
@@ -45,6 +47,8 @@ cat fixes.yaml
   - 支援 `--forbid-loops`、`--forbid-arrays`、`--forbid-functions`、`--forbid-stl`
   - 支援 `--function-names` 指定禁用函式清單
   - 支援 `--output-dir` 指定輸出目錄
+  - 支援 `--identifier-naming` 啟用命名檢查，並可用 `--fn-case`、`--var-case`、`--class-case`、`--param-case`、`--enum-case` 指定格式（`camelBack` / `CamelCase` / `snake_case` / `UPPER_CASE` / `lower_case`）
+  - 支援 `--include-cleaner` 啟用多餘 include 檢查
 - `examples/` — 測試用範例程式
   - `main.c` — C 語言範例（包含陣列）
   - `main.cpp` — C++ 範例（包含迴圈與 std::sort）
@@ -90,6 +94,12 @@ python3 scripts/generate_tidy_config.py --forbid-stl
 # 禁用特定函式（需同時指定 --forbid-functions）
 python3 scripts/generate_tidy_config.py --forbid-functions --function-names 'sort,printf,malloc'
 
+# 指定命名規範（例如：函式 camelBack、變數 snake_case）
+python3 scripts/generate_tidy_config.py --identifier-naming --fn-case camelBack --var-case snake_case
+
+# 啟用多餘 include 檢查
+python3 scripts/generate_tidy_config.py --include-cleaner
+
 # 組合使用：禁用迴圈、陣列和 STL
 python3 scripts/generate_tidy_config.py --forbid-loops --forbid-arrays --forbid-stl
 
@@ -105,7 +115,7 @@ python3 scripts/generate_tidy_config.py --forbid-loops --output-dir examples
 只禁用迴圈：
 ```yaml
 Checks: misc-forbid-loops
-WarningsAsErrors: '*'
+WarningsAsErrors: 'misc-forbid-*'
 ```
 
 禁用函式：
@@ -114,10 +124,10 @@ CheckOptions:
 - key: misc-forbid-functions.ForbiddenNames
   value: sort,printf,malloc
 Checks: misc-forbid-functions
-WarningsAsErrors: '*'
+WarningsAsErrors: 'misc-forbid-*'
 ```
 
-> **重要：**`WarningsAsErrors: '*'` 會將所有警告轉換為錯誤，確保違規代碼無法通過檢查。
+> **重要：**`WarningsAsErrors: 'misc-forbid-*'` 只會把自訂 `misc-forbid-*` 規則升級為錯誤；內建規則（命名、include cleaner 等）維持警告層級。
 
 這個步驟通常在 OJ 的題目設定階段由系統自動執行（出題者勾選要禁用的項目即可）。
 
@@ -257,7 +267,7 @@ CheckOptions:
 - key: misc-forbid-functions.ForbiddenNames
   value: sort,printf,malloc
 Checks: misc-forbid-loops,misc-forbid-arrays,misc-forbid-functions
-WarningsAsErrors: '*'
+WarningsAsErrors: 'misc-forbid-*'
 ```
 
 clang-tidy 會自動讀取該目錄的 `.clang-tidy` 設定並套用所有檢查規則。

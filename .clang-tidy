@@ -1,2 +1,9 @@
-Checks: misc-forbid-stl
-WarningsAsErrors: '*'
+CheckOptions:
+- key: misc-forbid-functions.ForbiddenNames
+  value: sort
+- key: readability-identifier-naming.FunctionCase
+  value: camelBack
+- key: readability-identifier-naming.VariableCase
+  value: snake_case
+Checks: misc-forbid-loops,misc-forbid-arrays,misc-forbid-functions,misc-forbid-stl,readability-identifier-naming,misc-include-cleaner
+WarningsAsErrors: misc-forbid-*

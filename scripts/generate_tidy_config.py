@@ -9,6 +9,8 @@ options = {
     "arrays": "--forbid-arrays" in sys.argv,
     "functions": "--forbid-functions" in sys.argv,
     "stl": "--forbid-stl" in sys.argv,
+    "id_naming": "--identifier-naming" in sys.argv,
+    "include_cleaner": "--include-cleaner" in sys.argv,
 }
 
 # 擷取禁止函式清單，例如：
@@ -38,19 +40,62 @@ if options["functions"]:
     checks.append("misc-forbid-functions")
 if options["stl"]:
     checks.append("misc-forbid-stl")
+if options["id_naming"]:
+    checks.append("readability-identifier-naming")
+if options["include_cleaner"]:
+    checks.append("misc-include-cleaner")
+
+# 解析命名規則
+allowed_cases = {
+    "camelBack",
+    "CamelCase",
+    "snake_case",
+    "UPPER_CASE",
+    "lower_case",
+}
+case_flags = {
+    "--fn-case": "FunctionCase",
+    "--var-case": "VariableCase",
+    "--class-case": "ClassCase",
+    "--param-case": "ParameterCase",
+    "--enum-case": "EnumConstantCase",
+}
+naming_options = {}
+for flag, key in case_flags.items():
+    if flag in sys.argv:
+        idx = sys.argv.index(flag)
+        if idx + 1 < len(sys.argv):
+            val = sys.argv[idx + 1]
+            if val not in allowed_cases:
+                print(f"[warn] {flag} unsupported case: {val} (allowed: {', '.join(sorted(allowed_cases))})")
+            else:
+                naming_options[key] = val
 
 # clang-tidy 設定
 config = {
     "Checks": ",".join(checks) if checks else "-*",
-    "WarningsAsErrors": "*",
+    # 只將自訂 misc 規則視為錯誤，新加入的內建規則維持警告級別
+    "WarningsAsErrors": "misc-forbid-*",
 }
 
 # 若有禁止函式清單則加入自訂參數
+check_options = []
+
 if forbidden_funcs and options["functions"]:
-    config["CheckOptions"] = [{
+    check_options.append({
         "key": "misc-forbid-functions.ForbiddenNames",
         "value": ",".join(forbidden_funcs)
-    }]
+    })
+
+if options["id_naming"]:
+    for k, v in naming_options.items():
+        check_options.append({
+            "key": f"readability-identifier-naming.{k}",
+            "value": v
+        })
+
+if check_options:
+    config["CheckOptions"] = check_options
 
 # 若沒有啟用 --forbid-functions，則忽略 --function-names 並提示
 if forbidden_funcs and not options["functions"]:
